@@ -39,6 +39,8 @@ nlohmann::json group_service::list_groups() const {
             {"port",     g.port},
             {"type",     g.type},
             {"test_url", g.test_url},
+            {"user",     g.user},
+            {"password", g.password},
         });
     }
     return arr;
@@ -54,6 +56,8 @@ nlohmann::json group_service::create_group(const nlohmann::json& body) {
             group.port     = body.value("port", 7890);
             group.type     = body.value("type", std::string{"socks5"});
             group.test_url = body.value("test_url", std::string{"http://www.gstatic.com/generate_204"});
+            group.user     = body.value("user", std::string{});
+            group.password = body.value("password", std::string{});
             c.proxy_groups.push_back(group);
         },
         config_change::group_created);
@@ -72,7 +76,9 @@ void group_service::update_group(std::uint32_t id, const nlohmann::json& patch) 
                         field_binding{"host",     &ProxyGroup::host},
                         field_binding{"port",     &ProxyGroup::port},
                         field_binding{"type",     &ProxyGroup::type},
-                        field_binding{"test_url", &ProxyGroup::test_url});
+                        field_binding{"test_url", &ProxyGroup::test_url},
+                        field_binding{"user",     &ProxyGroup::user},
+                        field_binding{"password", &ProxyGroup::password});
                     break;
                 }
             }
@@ -231,12 +237,38 @@ nlohmann::json group_service::test_group(std::uint32_t id) {
         return close_and_return(nlohmann::json{{"error", "proxy connect failed"}});
     }
 
-    std::uint8_t greeting[] = {0x05, 0x01, 0x00};
-    if (::send(sock, reinterpret_cast<const char*>(greeting), 3, 0) != 3) {
+    const bool want_auth = !group->user.empty() || !group->password.empty();
+    std::uint8_t greeting[] = {0x05, static_cast<std::uint8_t>(want_auth ? 0x02 : 0x01), 0x00, 0x02};
+    const int greeting_len = want_auth ? 4 : 3;
+    if (::send(sock, reinterpret_cast<const char*>(greeting), greeting_len, 0) != greeting_len) {
         return close_and_return(nlohmann::json{{"error", "send failed"}});
     }
     std::uint8_t greeting_reply[2] = {0};
-    if (::recv(sock, reinterpret_cast<char*>(greeting_reply), 2, 0) != 2 || greeting_reply[1] != 0x00) {
+    if (::recv(sock, reinterpret_cast<char*>(greeting_reply), 2, 0) != 2) {
+        return close_and_return(nlohmann::json{{"error", "socks5 auth failed"}});
+    }
+    if (want_auth && greeting_reply[1] == 0x02) {
+        // RFC 1929 username/password sub-negotiation
+        if (group->user.size() > 255 || group->password.size() > 255) {
+            return close_and_return(nlohmann::json{{"error", "socks5 auth failed: username/password exceed 255 bytes"}});
+        }
+        std::vector<std::uint8_t> creds;
+        creds.reserve(3 + group->user.size() + group->password.size());
+        creds.push_back(0x01);
+        creds.push_back(static_cast<std::uint8_t>(group->user.size()));
+        creds.insert(creds.end(), group->user.begin(), group->user.end());
+        creds.push_back(static_cast<std::uint8_t>(group->password.size()));
+        creds.insert(creds.end(), group->password.begin(), group->password.end());
+        if (::send(sock, reinterpret_cast<const char*>(creds.data()),
+                   static_cast<int>(creds.size()), 0) != static_cast<int>(creds.size())) {
+            return close_and_return(nlohmann::json{{"error", "send failed"}});
+        }
+        std::uint8_t creds_reply[2] = {0};
+        if (::recv(sock, reinterpret_cast<char*>(creds_reply), 2, 0) != 2 ||
+            creds_reply[0] != 0x01 || creds_reply[1] != 0x00) {
+            return close_and_return(nlohmann::json{{"error", "socks5 auth failed: username/password rejected"}});
+        }
+    } else if (greeting_reply[0] != 0x05 || greeting_reply[1] != 0x00) {
         return close_and_return(nlohmann::json{{"error", "socks5 auth failed"}});
     }
 

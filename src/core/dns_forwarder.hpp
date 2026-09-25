@@ -28,10 +28,12 @@ public:
     dns_forwarder(asio::io_context& ioc,
                   const std::string& listen_ip, uint16_t listen_port,
                   const std::string& proxy_host, uint16_t proxy_port,
+                  const std::string& proxy_user, const std::string& proxy_password,
                   const std::string& dns_server = "8.8.8.8", uint16_t dns_port = 53)
         : ioc_(ioc)
         , listen_ep_(asio::ip::make_address(listen_ip), listen_port)
         , proxy_host_(proxy_host), proxy_port_(proxy_port)
+        , proxy_user_(proxy_user), proxy_password_(proxy_password)
         , dns_server_(dns_server), dns_port_(dns_port)
         , listen_sock_(ioc)
     {}
@@ -45,7 +47,8 @@ public:
             running_ = true;
 
             // Establish SOCKS5 UDP ASSOCIATE session for DNS forwarding
-            socks5_session_ = std::make_shared<Socks5UdpSession>(ioc_, proxy_host_, proxy_port_);
+            socks5_session_ = std::make_shared<Socks5UdpSession>(
+                ioc_, proxy_host_, proxy_port_, proxy_user_, proxy_password_);
             if (!socks5_session_->establish()) {
                 PC_LOG_ERROR("[DNS-FWD] Failed to establish SOCKS5 session to {}:{}",
                               proxy_host_, proxy_port_);
@@ -84,6 +87,8 @@ private:
     asio::ip::udp::endpoint listen_ep_;
     std::string proxy_host_;
     uint16_t proxy_port_;
+    std::string proxy_user_;
+    std::string proxy_password_;
     std::string dns_server_;
     uint16_t dns_port_;
     uint32_t dns_ip_net_{0};  // network byte order
@@ -150,7 +155,8 @@ private:
 
             // Reconnect SOCKS5 session if dead
             if (!socks5_session_ || !socks5_session_->is_alive()) {
-                socks5_session_ = std::make_shared<Socks5UdpSession>(ioc_, proxy_host_, proxy_port_);
+                socks5_session_ = std::make_shared<Socks5UdpSession>(
+                    ioc_, proxy_host_, proxy_port_, proxy_user_, proxy_password_);
                 if (!socks5_session_->establish()) {
                     PC_LOG_ERROR("[DNS-FWD] SOCKS5 reconnect failed");
                     continue;

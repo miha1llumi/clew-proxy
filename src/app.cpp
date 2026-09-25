@@ -176,8 +176,8 @@ void app::sync_groups() {
     tcp_groups_.clear();
     udp_groups_.clear();
     for (const auto& g : config_.get_v2().proxy_groups) {
-        tcp_groups_[g.id] = {g.host, g.port};
-        udp_groups_[g.id] = {g.host, g.port};
+        tcp_groups_[g.id] = {g.host, g.port, g.user, g.password};
+        udp_groups_[g.id] = {g.host, g.port, g.user, g.password};
     }
     PC_LOG_INFO("Proxy groups synced: {} groups", tcp_groups_.size());
 }
@@ -228,12 +228,14 @@ nlohmann::json app::traffic_stats() const {
     return j;
 }
 
-std::pair<std::string, uint16_t> app::pick_proxy_endpoint() const {
+ProxyGroupConfig app::pick_proxy_endpoint() const {
     const auto& v2 = config_.get_v2();
     if (!v2.proxy_groups.empty()) {
-        return {v2.proxy_groups[0].host, v2.proxy_groups[0].port};
+        const auto& g = v2.proxy_groups[0];
+        return {g.host, g.port, g.user, g.password};
     }
-    return {v2.default_proxy.host, v2.default_proxy.port};
+    const auto& d = v2.default_proxy;
+    return {d.host, d.port, d.user, d.password};
 }
 
 void app::wire_observers() {
@@ -254,8 +256,8 @@ void app::wire_observers() {
             }
             sync_groups();
             set_log_level(cfg.log_level);
-            auto [ph, pp] = pick_proxy_endpoint();
-            dns_mgr_.apply(cfg.dns, ph, pp);
+            auto ep = pick_proxy_endpoint();
+            dns_mgr_.apply(cfg.dns, ep.host, ep.port, ep.user, ep.password);
         });
 }
 
@@ -315,8 +317,8 @@ void app::start_servers_and_workers() {
     }
     PC_LOG_INFO("HTTP API: http://127.0.0.1:{}/", API_PORT);
 
-    auto [ph, pp] = pick_proxy_endpoint();
-    dns_mgr_.apply(config_.get_v2().dns, ph, pp);
+    auto ep = pick_proxy_endpoint();
+    dns_mgr_.apply(config_.get_v2().dns, ep.host, ep.port, ep.user, ep.password);
 
     tree_mgr_.start();
 

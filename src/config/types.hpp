@@ -152,13 +152,15 @@ struct ProxyGroup {
     uint16_t port = 7890;
     std::string type = "socks5";        // Only "socks5" for now
     std::string test_url = "http://www.gstatic.com/generate_204";
+    std::string user;                   // Optional SOCKS5 auth (RFC 1929)
+    std::string password;               // Optional SOCKS5 auth (RFC 1929)
 
     std::string to_string() const {
         return std::format("{}://{}:{}", type, host, port);
     }
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ProxyGroup, id, name, host, port, type, test_url)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ProxyGroup, id, name, host, port, type, test_url, user, password)
 
 // ============================================================
 // Traffic Filter - IP/port include/exclude

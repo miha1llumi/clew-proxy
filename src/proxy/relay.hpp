@@ -35,6 +35,8 @@ using asio::experimental::awaitable_operators::operator||;
 struct ProxyGroupConfig {
     std::string host;
     uint16_t    port{7890};
+    std::string user;
+    std::string password;
 };
 
 // Unidirectional pipe: read from `from`, write to `to`.
@@ -105,13 +107,16 @@ handle_connection(tcp::socket client_sock,
     struct GroupInfo {
         std::string host;
         uint16_t port;
+        std::string user;
+        std::string password;
     };
 
     auto cfg_opt = co_await asio::co_spawn(strand,
         [&groups, group_id = entry->group_id]() -> asio::awaitable<std::optional<GroupInfo>> {
             auto it = groups.find(group_id);
             if (it == groups.end()) co_return std::nullopt;
-            co_return GroupInfo{it->second.host, it->second.port};
+            co_return GroupInfo{it->second.host, it->second.port,
+                                it->second.user, it->second.password};
         }, asio::use_awaitable);
 
     if (!cfg_opt) {
@@ -149,7 +154,8 @@ handle_connection(tcp::socket client_sock,
         auto t1 = std::chrono::steady_clock::now();
 
         // SOCKS5 handshake — establish tunnel to original destination
-        co_await socks5_handshake(proxy_sock, dest_addr, dest_port);
+        co_await socks5_handshake(proxy_sock, dest_addr, dest_port,
+                                  cfg_opt->user, cfg_opt->password);
 
         auto t2 = std::chrono::steady_clock::now();
         auto connect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();

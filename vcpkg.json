@@ -1,0 +1,11 @@
+{
+  "name": "clew",
+  "version": "0.7.0",
+  "builtin-baseline": "6ade29bbd5a4c7e99439ec52adbc63c073953a57",
+  "dependencies": [
+    "quill",
+    "nlohmann-json",
+    "cpp-httplib",
+    "asio"
+  ]
+}

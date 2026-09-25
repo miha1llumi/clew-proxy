@@ -95,7 +95,7 @@ private:
     void shutdown() noexcept;
 
     void                                           sync_groups();
-    [[nodiscard]] std::pair<std::string, uint16_t> pick_proxy_endpoint() const;
+    [[nodiscard]] ProxyGroupConfig               pick_proxy_endpoint() const;
     [[nodiscard]] std::unique_ptr<webview_app>     create_gui();
     // SOCKET-layer + SYN-parking counters for /api/stats (called off-strand).
     [[nodiscard]] nlohmann::json                   traffic_stats() const;

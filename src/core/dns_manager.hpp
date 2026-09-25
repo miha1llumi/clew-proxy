@@ -63,7 +63,8 @@ public:
     //   on → off:  stop forwarder + restore system DNS
     //   both on:   if upstream/listen changed → restart forwarder (+ re-set DNS if listen changed)
     void apply(const DnsConfig& cfg,
-               const std::string& proxy_host, uint16_t proxy_port) {
+               const std::string& proxy_host, uint16_t proxy_port,
+               const std::string& proxy_user, const std::string& proxy_password) {
         const bool was_enabled = current_cfg_.enabled;
         const bool want_enabled = cfg.enabled && cfg.mode == "forwarder";
 
@@ -79,7 +80,7 @@ public:
 
         if (!was_enabled && want_enabled) {
             // off → on
-            start_forwarder(cfg, proxy_host, proxy_port);
+            start_forwarder(cfg, proxy_host, proxy_port, proxy_user, proxy_password);
             set_system_dns(cfg.listen_host);
             current_cfg_ = cfg;
             return;
@@ -100,14 +101,16 @@ public:
             current_cfg_.listen_host != cfg.listen_host ||
             current_cfg_.listen_port != cfg.listen_port ||
             current_proxy_host_ != proxy_host ||
-            current_proxy_port_ != proxy_port;
+            current_proxy_port_ != proxy_port ||
+            current_proxy_user_ != proxy_user ||
+            current_proxy_password_ != proxy_password;
 
         const bool listen_changed = current_cfg_.listen_host != cfg.listen_host;
 
         if (fwd_target_changed) {
             PC_LOG_INFO("[DNS-MGR] Config changed, restarting forwarder");
             stop_forwarder();
-            start_forwarder(cfg, proxy_host, proxy_port);
+            start_forwarder(cfg, proxy_host, proxy_port, proxy_user, proxy_password);
         }
 
         if (listen_changed) {
@@ -137,14 +140,17 @@ private:
     DnsConfig current_cfg_{};
     std::string current_proxy_host_;
     uint16_t current_proxy_port_ = 0;
+    std::string current_proxy_user_;
+    std::string current_proxy_password_;
     bool system_dns_modified_ = false;
     std::vector<system_dns::InterfaceDnsState> saved_states_;
 
     void start_forwarder(const DnsConfig& cfg,
-                         const std::string& proxy_host, uint16_t proxy_port) {
+                         const std::string& proxy_host, uint16_t proxy_port,
+                         const std::string& proxy_user, const std::string& proxy_password) {
         forwarder_ = std::make_unique<dns_forwarder>(
             ioc_, cfg.listen_host, cfg.listen_port,
-            proxy_host, proxy_port,
+            proxy_host, proxy_port, proxy_user, proxy_password,
             cfg.upstream_host, cfg.upstream_port);
         if (forwarder_->start()) {
             PC_LOG_INFO("[DNS-MGR] Forwarder started: {}:{} -> SOCKS5 {}:{} -> {}:{}",
@@ -153,6 +159,8 @@ private:
                          cfg.upstream_host, cfg.upstream_port);
             current_proxy_host_ = proxy_host;
             current_proxy_port_ = proxy_port;
+            current_proxy_user_ = proxy_user;
+            current_proxy_password_ = proxy_password;
         } else {
             PC_LOG_WARN("[DNS-MGR] Forwarder failed to start");
             forwarder_.reset();

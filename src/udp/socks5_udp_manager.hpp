@@ -27,6 +27,8 @@ namespace clew {
 struct UdpProxyGroupConfig {
     std::string host;
     uint16_t port{1080};
+    std::string user;
+    std::string password;
 };
 
 // Callback when a new per-port session is created (for spawning downstream coroutine)
@@ -66,7 +68,8 @@ public:
         }
 
         auto session = std::make_shared<Socks5UdpSession>(
-            ioc_, git->second.host, git->second.port);
+            ioc_, git->second.host, git->second.port,
+            git->second.user, git->second.password);
 
         if (!session->establish()) {
             PC_LOG_ERROR("[SOCKS5-MGR] Failed to establish session for port={} group={}",

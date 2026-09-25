@@ -30,10 +30,14 @@ using asio::ip::udp;
 class Socks5UdpSession : public std::enable_shared_from_this<Socks5UdpSession> {
 public:
     Socks5UdpSession(asio::io_context& ioc,
-                     const std::string& proxy_host, uint16_t proxy_port)
+                     const std::string& proxy_host, uint16_t proxy_port,
+                     const std::string& proxy_user = "",
+                     const std::string& proxy_password = "")
         : ioc_(ioc)
         , proxy_host_(proxy_host)
         , proxy_port_(proxy_port)
+        , proxy_user_(proxy_user)
+        , proxy_password_(proxy_password)
         , tcp_control_(ioc)
         , udp_data_(ioc)
     {}
@@ -49,14 +53,42 @@ public:
             auto endpoints = resolver.resolve(proxy_host_, std::to_string(proxy_port_));
             asio::connect(tcp_control_, endpoints);
 
-            // Auth handshake (NO_AUTH)
-            uint8_t auth_req[] = {0x05, 0x01, 0x00};
-            asio::write(tcp_control_, asio::buffer(auth_req));
+            // Greeting: NO_AUTH, or NO_AUTH+USER/PASS when creds are configured
+            const bool want_auth = !proxy_user_.empty() || !proxy_password_.empty();
+            uint8_t auth_req[] = {0x05, static_cast<uint8_t>(want_auth ? 0x02 : 0x01), 0x00, 0x02};
+            asio::write(tcp_control_,
+                        asio::buffer(auth_req, want_auth ? 4u : 3u));
 
             uint8_t auth_resp[2]{};
             asio::read(tcp_control_, asio::buffer(auth_resp));
-            if (auth_resp[0] != 0x05 || auth_resp[1] != 0x00) {
+            if (auth_resp[0] != 0x05) {
                 PC_LOG_ERROR("[SOCKS5-UDP] Auth rejected");
+                return false;
+            }
+            if (want_auth && auth_resp[1] == 0x02) {
+                // RFC 1929 username/password sub-negotiation
+                if (proxy_user_.size() > 255 || proxy_password_.size() > 255) {
+                    PC_LOG_ERROR("[SOCKS5-UDP] Auth rejected: username/password exceed 255 bytes");
+                    return false;
+                }
+                std::vector<uint8_t> creds;
+                creds.reserve(3 + proxy_user_.size() + proxy_password_.size());
+                creds.push_back(0x01);  // VER of sub-negotiation
+                creds.push_back(static_cast<uint8_t>(proxy_user_.size()));
+                creds.insert(creds.end(), proxy_user_.begin(), proxy_user_.end());
+                creds.push_back(static_cast<uint8_t>(proxy_password_.size()));
+                creds.insert(creds.end(), proxy_password_.begin(), proxy_password_.end());
+                asio::write(tcp_control_, asio::buffer(creds));
+
+                uint8_t creds_resp[2]{};
+                asio::read(tcp_control_, asio::buffer(creds_resp));
+                if (creds_resp[0] != 0x01 || creds_resp[1] != 0x00) {
+                    PC_LOG_ERROR("[SOCKS5-UDP] Auth rejected: username/password rejected");
+                    return false;
+                }
+            } else if (auth_resp[1] != 0x00) {
+                PC_LOG_ERROR("[SOCKS5-UDP] Auth rejected: unsupported method 0x{:02X}",
+                              auth_resp[1]);
                 return false;
             }
 
@@ -233,6 +265,8 @@ private:
     asio::io_context& ioc_;
     std::string proxy_host_;
     uint16_t proxy_port_;
+    std::string proxy_user_;
+    std::string proxy_password_;
 
     tcp::socket tcp_control_;
     udp::socket udp_data_;
