@@ -64,13 +64,19 @@ public:
     // PID the tree doesn't know yet (see process_tree_manager::resolve_pid_now).
     // Returns true once the PID is in the tree.
     // parker: the SYN-parking pool/injector, or nullptr when parking is off.
+    // exclude_processes: file names (e.g. "gost.exe") that are never proxied,
+    // whatever the rules say -- redirect.exclude_processes. Same purpose as
+    // the self-PID guard, for the processes we talk *through* rather than
+    // from: a broad rule matching gost.exe would otherwise route our own
+    // upstream socket back into the acceptor (clew -> gost -> clew).
     windivert_socket(asio::io_context& ioc,
                      asio::strand<asio::io_context::executor_type>& strand,
                      flat_tree& tree,
                      rule_engine_v3& rules,
                      PortTracker& tracker,
                      std::function<bool(DWORD)> resolve_unknown_pid,
-                     syn_parker* parker = nullptr)
+                     syn_parker* parker = nullptr,
+                     std::vector<std::string> exclude_processes = {})
         : ioc_(ioc)
         , strand_(strand)
         , tree_(tree)
@@ -78,6 +84,7 @@ public:
         , tracker_(tracker)
         , resolve_unknown_pid_(std::move(resolve_unknown_pid))
         , parker_(parker)
+        , exclude_processes_(std::move(exclude_processes))
         , self_pid_(GetCurrentProcessId())
     {}
 
@@ -167,6 +174,7 @@ private:
     PortTracker& tracker_;
     std::function<bool(DWORD)> resolve_unknown_pid_;
     syn_parker* parker_;
+    std::vector<std::string> exclude_processes_;
     const DWORD self_pid_;
 
     HANDLE handle_{INVALID_HANDLE_VALUE};
@@ -304,6 +312,14 @@ private:
         }
     }
 
+    // Case-insensitive match against redirect.exclude_processes.
+    bool is_excluded_process(const char* name) const {
+        for (const auto& e : exclude_processes_) {
+            if (_stricmp(name, e.c_str()) == 0) return true;
+        }
+        return false;
+    }
+
     // The decision for one CONNECT. Fills te.group_id when proxied; `why`
     // names the direct reason for the log line.
     slot_state decide(DWORD pid, const WINDIVERT_ADDRESS& addr, TrackerEntry& te, const char*& why) {
@@ -342,6 +358,14 @@ private:
         }
 
         const auto& entry = tree_.at(idx);
+        // redirect.exclude_processes: never proxy these, whatever the rules
+        // say. Checked before the group test on purpose -- a broad rule must
+        // not be able to pull our own upstream (e.g. gost.exe) back into the
+        // acceptor.
+        if (is_excluded_process(entry.name_u8)) {
+            why = "excluded-process";
+            return slot_state::direct;
+        }
         if (!entry.alive || !entry.is_proxied()) {
             why = "not-proxied";
             return slot_state::direct;

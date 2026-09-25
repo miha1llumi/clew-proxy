@@ -81,8 +81,20 @@ app::app(const cli_options& opts, HINSTANCE hinstance)
     sync_groups();
     dns_mgr_.recover_crash_state();
 
-    redirect_port_ = acceptor_.start();
-    PC_LOG_INFO("Acceptor listening on port {}", redirect_port_);
+    {
+        const auto& rd = config_.get_v2().redirect;
+        if (rd.listen_host != "0.0.0.0") {
+            PC_LOG_WARN("[ACCEPTOR] redirect.listen_host={}: reflect reinjects each flow as "
+                        "orig_dst -> app_ip:redirect_port, i.e. addressed to a real local "
+                        "address. A bind narrower than 0.0.0.0 may refuse those flows.",
+                        rd.listen_host);
+        }
+        redirect_port_ = acceptor_.start(rd.listen_host, rd.listen_port);
+        PC_LOG_INFO("Acceptor listening on port {} (bind={}, tcp_idle={}s udp_idle={}s "
+                    "excluded_processes={})",
+                    redirect_port_, rd.listen_host, rd.tcp_idle_timeout_seconds,
+                    rd.udp_idle_timeout_seconds, rd.exclude_processes.size());
+    }
 
     // SYN parking (kill switch: tcp_syn_parking.enabled). Off means no pool,
     // no injector thread, and both TCP layers fall back to the pre-parking
@@ -107,7 +119,8 @@ app::app(const cli_options& opts, HINSTANCE hinstance)
 
     wd_socket_      = std::make_unique<windivert_socket>(ioc_, strand_, tree_mgr_.tree(),
                                                          tree_mgr_.rules(), *port_tracker_,
-                                                         resolve_unknown_pid, parker_.get());
+                                                         resolve_unknown_pid, parker_.get(),
+                                                         config_.get_v2().redirect.exclude_processes);
     wd_network_     = std::make_unique<windivert_network>(*port_tracker_, redirect_port_,
                                                           parker_.get());
     wd_socket_udp_  = std::make_unique<windivert_socket_udp>(ioc_, strand_, tree_mgr_.tree(),
@@ -368,11 +381,50 @@ void app::start_traffic_layers() {
 
         udp_relay_ = std::make_unique<UdpRelay>(
             ioc_, udp_session_table_, socks5_udp_mgr_,
-            wd_network_udp_->handle(), UDP_RELAY_PORT);
+            wd_network_udp_->handle(), UDP_RELAY_PORT,
+            std::chrono::seconds(config_.get_v2().redirect.udp_idle_timeout_seconds));
         if (udp_relay_->start()) {
             PC_LOG_INFO("UDP Relay started on port {}", UDP_RELAY_PORT);
         }
     }
+
+    start_idle_sweep();
+}
+
+// Safety net for tracker slots whose SOCKET CLOSE was never observed (process
+// killed, event dropped). Off unless redirect.tcp_idle_timeout_seconds > 0,
+// which is the v0.10.0 behaviour -- see RedirectConfig.
+void app::start_idle_sweep() {
+    const int timeout_s = config_.get_v2().redirect.tcp_idle_timeout_seconds;
+    if (timeout_s <= 0) {
+        PC_LOG_INFO("[IDLE-SWEEP] disabled (redirect.tcp_idle_timeout_seconds=0)");
+        return;
+    }
+    const int64_t idle_ticks = port_tracker_->ms_to_ticks(static_cast<int64_t>(timeout_s) * 1000);
+    // Half the timeout, so a dead flow is never left for much longer than the
+    // configured value; the sweep itself is O(65536) atomic loads.
+    const auto interval = std::chrono::seconds(std::max(1, timeout_s / 2));
+    // The sweep MUST run on the strand that owns PortTracker writes. A decided
+    // slot word (decided_word()) is identical for every flow in a given state,
+    // so a sweep running on the raw io_context could CAS a freshly published
+    // decision (publish() writes the same word value) back to empty and make a
+    // brand-new proxied flow fall through to direct. Serializing with
+    // publish()/on_close()/clear_if() removes that race.
+    idle_sweep_timer_ = std::make_unique<asio::steady_timer>(strand_);
+    arm_idle_sweep(idle_ticks, interval);
+    PC_LOG_INFO("[IDLE-SWEEP] enabled: timeout={}s interval={}s", timeout_s, interval.count());
+}
+
+void app::arm_idle_sweep(int64_t idle_ticks, std::chrono::seconds interval) {
+    idle_sweep_timer_->expires_after(interval);
+    idle_sweep_timer_->async_wait([this, idle_ticks, interval](const asio::error_code& ec) {
+        if (ec || shut_down_) return;
+        const size_t cleared = port_tracker_->sweep_idle(PortTracker::now_ticks(), idle_ticks);
+        if (cleared != 0) {
+            PC_LOG_INFO("[IDLE-SWEEP] cleared {} stale tracker slot(s)", cleared);
+        }
+        arm_idle_sweep(idle_ticks, interval);
+    });
 }
 
 int app::run_main_loop() {

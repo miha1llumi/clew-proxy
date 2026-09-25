@@ -22,6 +22,8 @@
 #include <windows.h>
 #include <windivert.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -40,13 +42,16 @@ public:
              UdpSessionTable& session_table,
              Socks5UdpManager& socks5_mgr,
              HANDLE wd_handle,
-             uint16_t relay_port)
+             uint16_t relay_port,
+             std::chrono::seconds session_idle_timeout = std::chrono::seconds(120))
         : ioc_(ioc)
         , session_table_(session_table)
         , socks5_mgr_(socks5_mgr)
         , wd_handle_(wd_handle)
         , relay_port_(relay_port)
         , relay_socket_(ioc)
+        , session_idle_timeout_(session_idle_timeout)
+        , sweep_timer_(ioc)
     {
         // When a new per-port SOCKS5 session is created, spawn its downstream coroutine
         socks5_mgr_.set_on_session_created(
@@ -67,6 +72,7 @@ public:
             running_ = true;
 
             asio::co_spawn(ioc_, upstream_loop(), asio::detached);
+            schedule_sweep();
 
             return true;
         } catch (const std::exception& e) {
@@ -87,6 +93,9 @@ public:
 
         socks5_mgr_.set_on_session_created(nullptr);
 
+        asio::error_code tec;
+        sweep_timer_.cancel(tec);
+
         asio::error_code ec;
         relay_socket_.close(ec);
 
@@ -106,12 +115,34 @@ private:
     uint16_t relay_port_;
 
     asio::ip::udp::socket relay_socket_;
+    std::chrono::seconds  session_idle_timeout_;
+    asio::steady_timer    sweep_timer_;
     bool stopped_{false};
     std::atomic<bool> running_{false};
 
     std::atomic<uint64_t> upstream_count_{0};
     std::atomic<uint64_t> downstream_count_{0};
     std::atomic<uint64_t> injected_count_{0};
+
+    // Periodic idle sweep of UdpSessionTable (redirect.udp_idle_timeout_seconds).
+    // Without it sessions are only removed explicitly and the table grows for
+    // the whole uptime. Half the timeout, so a session is never idle for much
+    // longer than the configured value before it is collected. Clamped to >= 1s
+    // because `seconds / 2` is integer division: a 1s timeout would otherwise
+    // re-arm with 0 and spin the timer as fast as the loop allows.
+    void schedule_sweep() {
+        const auto interval = std::max(std::chrono::seconds(1), session_idle_timeout_ / 2);
+        sweep_timer_.expires_after(interval);
+        sweep_timer_.async_wait([this](const asio::error_code& ec) {
+            if (ec || stopped_) return;
+            const size_t removed = session_table_.cleanup_expired(session_idle_timeout_);
+            if (removed != 0) {
+                PC_LOG_DEBUG("[UDP-RELAY] idle sweep removed {} session(s), {} left",
+                             removed, session_table_.size());
+            }
+            if (!stopped_) schedule_sweep();
+        });
+    }
 
     // Spawn a downstream coroutine for a newly created per-port session
     void spawn_downstream(uint16_t app_port, std::shared_ptr<Socks5UdpSession> session) {

@@ -2,8 +2,12 @@
 
 // Asio-based TCP acceptor for redirected connections.
 // Replaces blocking local_listener.hpp.
-// Binds to 0.0.0.0:0 (INADDR_ANY, ephemeral port) and accepts
-// connections redirected by the NETWORK layer.
+// Binds to redirect.listen_host:redirect.listen_port and accepts
+// connections redirected by the NETWORK layer. The default ("0.0.0.0", 0) is
+// v0.10.0 behaviour: INADDR_ANY + an ephemeral port. INADDR_ANY is not a
+// convenience here -- reflect reinjects the swapped packet inbound as
+// orig_dst -> app_ip:redirect_port, i.e. addressed to a real local address,
+// which a socket bound to 127.0.0.1 would refuse.
 
 #define ASIO_STANDALONE
 #include <asio.hpp>
@@ -12,6 +16,9 @@
 #include <asio/use_awaitable.hpp>
 
 #include <atomic>
+#include <format>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include "core/log.hpp"
 
@@ -34,14 +41,20 @@ public:
         , groups_(groups)
     {}
 
-    // Start listening. Returns the bound port.
-    uint16_t start() {
+    // Start listening on host:port (port 0 = ephemeral). Returns the bound port.
+    uint16_t start(const std::string& host, uint16_t port) {
         auto ex = ioc_.get_executor();
-        tcp::endpoint ep(asio::ip::make_address("0.0.0.0"), 0);
-        acceptor_ = std::make_unique<tcp::acceptor>(ex, ep);
+        tcp::endpoint ep(asio::ip::make_address(host), port);
+        try {
+            acceptor_ = std::make_unique<tcp::acceptor>(ex, ep);
+        } catch (const std::exception& e) {
+            PC_LOG_ERROR("[ACCEPTOR] Cannot bind {}:{}: {}", host, port, e.what());
+            throw std::runtime_error(std::format("cannot bind redirect listener on {}:{}: {}",
+                                                 host, port, e.what()));
+        }
 
         port_ = acceptor_->local_endpoint().port();
-        PC_LOG_INFO("[ACCEPTOR] Listening on port {}", port_);
+        PC_LOG_INFO("[ACCEPTOR] Listening on {}:{}", host, port_);
 
         // Launch accept loop as coroutine
         asio::co_spawn(ioc_, accept_loop(), asio::detached);

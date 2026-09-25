@@ -106,6 +106,12 @@ struct alignas(64) TrackerSlot {
     std::atomic<uint64_t> word{EMPTY_WORD};
     int64_t      connect_ts{0};   // kernel Timestamp of the CONNECT that produced the decision (strand-owned)
     int64_t      pinned_ts{0};    // kernel Timestamp of the SYN the watchdog released (injector/worker-owned)
+    // Last time this flow carried a packet, same QPC timebase as connect_ts.
+    // Only used by the idle sweep (redirect.tcp_idle_timeout_seconds), which
+    // is off by default; relaxed, because a slightly stale value at worst
+    // shortens the measured idle time and the sweep is a safety net for
+    // missed CLOSEs, never the primary teardown path.
+    std::atomic<int64_t> last_seen{0};
     TrackerEntry entry{};
     std::atomic<uint32_t> syn_seq{0};   // ISN of the last SYN the NETWORK worker handled on this port (worker-owned)
 };
@@ -156,6 +162,14 @@ public:
     int64_t ms_to_ticks(int64_t ms) const { return ms * qpc_freq_ / 1000; }
     int64_t qpc_frequency() const { return qpc_freq_; }
 
+    // "Now" in the same timebase as WINDIVERT_ADDRESS.Timestamp / connect_ts,
+    // so the idle sweep can compare against them directly.
+    static int64_t now_ticks() {
+        LARGE_INTEGER c{};
+        QueryPerformanceCounter(&c);
+        return c.QuadPart;
+    }
+
     // ---- NETWORK workers ----------------------------------------------
 
     // Non-SYN outbound packet on this port: reflect it?
@@ -191,6 +205,20 @@ public:
         return slots_[port].syn_seq.load(std::memory_order_relaxed) == seq;
     }
 
+    // Mark the flow as carrying a packet right now. Only read by the idle
+    // sweep; relaxed, and the slot may be concurrently recycled (see the
+    // comment on TrackerSlot::last_seen).
+    //
+    // LOAD-BEARING for sweep_idle(): publish() only seeds last_seen with the
+    // CONNECT timestamp, so a flow that is never touched looks exactly like an
+    // abandoned one after the idle timeout and would be swept mid-session.
+    // windivert_network calls this on every decided segment it sees in BOTH
+    // directions (worker_loop forward path and reflect_reply). If you move or
+    // drop those calls, a long-lived flow (Roblox) dies after tcp_idle_timeout.
+    void touch(uint16_t port, int64_t ts) {
+        slots_[port].last_seen.store(ts, std::memory_order_relaxed);
+    }
+
     // The worker's only transition: `expected` -> pending(gen, idx). Fails when
     // a decision landed in between; the caller then re-reads and acts on it.
     bool try_park(uint16_t port, uint64_t expected, uint32_t gen, uint32_t idx) {
@@ -208,6 +236,39 @@ public:
         return s.word.compare_exchange_strong(
             expected, decided_word(slot_state::abandoned),
             std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    // ---- idle sweep (maintenance thread) --------------------------------
+
+    // Clear decided slots whose flow has been idle for more than `idle_ticks`.
+    // This is a safety net for flows whose SOCKET CLOSE was never observed
+    // (process killed, event dropped): without it the port keeps a stale
+    // decision and the next connection to reuse it inherits it, which routes
+    // replies to the wrong instance. Never the primary teardown path --
+    // on_close / clear_if do that. Disabled entirely when the caller passes
+    // idle_ticks <= 0, which is the v0.10.0 behaviour.
+    //
+    // Only the word is CASed to empty; the aux fields are left alone so the
+    // sweep never writes the entry a concurrent reader may be copying.
+    // Returns the number of slots cleared.
+    size_t sweep_idle(int64_t now, int64_t idle_ticks) {
+        if (idle_ticks <= 0) return 0;
+        size_t cleared = 0;
+        for (uint32_t p = 0; p < slots_.size(); ++p) {
+            auto& s = slots_[p];
+            uint64_t w = s.word.load(std::memory_order_acquire);
+            const auto st = word_state(w);
+            if (st != slot_state::proxied && st != slot_state::direct) continue;
+            const int64_t last = s.last_seen.load(std::memory_order_relaxed);
+            const int64_t base = last != 0 ? last : s.connect_ts;
+            if (now - base <= idle_ticks) continue;
+            if (s.word.compare_exchange_strong(w, EMPTY_WORD,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+                ++cleared;
+            }
+        }
+        return cleared;
     }
 
     // ---- strand ---------------------------------------------------------
@@ -241,6 +302,7 @@ public:
             // Aux first, then the release-CAS.
             s.connect_ts = connect_ts;
             s.entry      = e;
+            s.last_seen.store(connect_ts, std::memory_order_relaxed);
 
             if (st == slot_state::pending) {
                 const parked_ref ref{word_idx(w), word_gen(w)};

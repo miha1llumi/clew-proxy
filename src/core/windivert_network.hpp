@@ -233,6 +233,10 @@ private:
             // the original destination (the kernel still thinks it is
             // connected there); their src_port is the app's port.
             if (tracker_.should_reflect(src_port)) {
+                // Liveness for the idle sweep: any segment of a decided flow
+                // extends its deadline, so a long-lived session is never swept
+                // while it is still carrying data. Same timebase as connect_ts.
+                tracker_.touch(src_port, addr.Timestamp);
                 reflect_outbound_packet(handle_, pkt_buf, pkt_len, &addr, redirect_port_);
                 nat_count_.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -254,6 +258,9 @@ private:
             WinDivertSend(handle_, pkt_buf, pkt_len, nullptr, addr);
             return;
         }
+
+        // Liveness for the idle sweep (see worker_loop): a reply is activity.
+        tracker_.touch(app_port, addr->Timestamp);
 
         const auto& entry = tracker_.peek(app_port);
 

@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -39,6 +40,7 @@
 
 // Components under test
 #include "config/types.hpp"
+#include "config/config_manager.hpp"
 #include "process/flat_tree.hpp"
 #include "rules/rule_engine_v3.hpp"
 #include "rules/traffic_filter.hpp"
@@ -1455,6 +1457,227 @@ TEST(sync_resolve_chain_must_insert_top_down) {
 
         ASSERT_EQ(tree.at(cidx).group_id, NO_PROXY);
     }
+}
+
+// ============================================================
+// redirect config contract (version 2 and 3)
+// ============================================================
+
+using clew::ConfigV2;
+using clew::RedirectConfig;
+using clew::config_manager;
+using clew::validate_redirect;
+
+TEST(redirect_config_defaults_match_v010_behaviour) {
+    // An absent `redirect` block must mean "behave exactly like v0.10.0":
+    // INADDR_ANY + ephemeral acceptor port, no TCP idle sweep, the 120s UDP
+    // session timeout that cleanup_expired already defaulted to, no excludes.
+    const RedirectConfig r{};
+    ASSERT_EQ(r.listen_host, std::string("0.0.0.0"));
+    ASSERT_EQ(r.listen_port, uint16_t{0});
+    ASSERT_EQ(r.tcp_idle_timeout_seconds, 0);
+    ASSERT_EQ(r.udp_idle_timeout_seconds, 120);
+    ASSERT_TRUE(r.exclude_processes.empty());
+}
+
+TEST(redirect_config_validate_listen_host) {
+    RedirectConfig r{};
+    r.listen_host = "0.0.0.0";
+    ASSERT_TRUE(validate_redirect(r).empty());
+
+    // reflect requires INADDR_ANY, but a concrete local address is a legal
+    // value (it only logs a warning) -- the validator must not reject it.
+    r.listen_host = "192.168.1.55";
+    ASSERT_TRUE(validate_redirect(r).empty());
+    r.listen_host = "127.0.0.1";
+    ASSERT_TRUE(validate_redirect(r).empty());
+
+    for (const char* bad : {"", "localhost", "0.0.0", "1.2.3.4.5", "999.1.1.1",
+                            "1.2.3", "1.2.3.4.", ".1.2.3.4", "1.2.3.04x"}) {
+        r.listen_host = bad;
+        ASSERT_TRUE(!validate_redirect(r).empty());
+    }
+}
+
+TEST(redirect_config_validate_timeouts_and_exclude_names) {
+    RedirectConfig r{};
+
+    r.tcp_idle_timeout_seconds = -1;
+    ASSERT_TRUE(!validate_redirect(r).empty());
+    r.tcp_idle_timeout_seconds = 0;   // 0 = disabled, legal
+    ASSERT_TRUE(validate_redirect(r).empty());
+
+    r.udp_idle_timeout_seconds = 0;
+    ASSERT_TRUE(!validate_redirect(r).empty());
+    r.udp_idle_timeout_seconds = -5;
+    ASSERT_TRUE(!validate_redirect(r).empty());
+    r.udp_idle_timeout_seconds = 120;
+    ASSERT_TRUE(validate_redirect(r).empty());
+
+    r.exclude_processes = {""};
+    ASSERT_TRUE(!validate_redirect(r).empty());
+    r.exclude_processes = {"gost.exe"};
+    ASSERT_TRUE(validate_redirect(r).empty());
+    // Names, not paths: a path would silently never match a process name.
+    r.exclude_processes = {"sub\\gost.exe"};
+    ASSERT_TRUE(!validate_redirect(r).empty());
+    r.exclude_processes = {"clew.exe", "gost.exe"};
+    ASSERT_TRUE(validate_redirect(r).empty());
+}
+
+TEST(config_manager_accepts_version_2_and_3_and_rejects_4) {
+    ScopedTestDirectory dir("cfgver");
+    const auto path = dir.file("clew.json");
+
+    config_manager cm(path);
+    ASSERT_TRUE(cm.set_raw_config(R"({"version": 2, "proxy_groups": []})").empty());
+
+    // Version 3 with a well-formed redirect block.
+    ASSERT_TRUE(cm.set_raw_config(R"({
+        "version": 3,
+        "proxy_groups": [],
+        "redirect": {
+            "listen_host": "0.0.0.0",
+            "listen_port": 16666,
+            "tcp_idle_timeout_seconds": 300,
+            "udp_idle_timeout_seconds": 60,
+            "exclude_processes": ["clew.exe", "gost.exe"]
+        }
+    })").empty());
+    ASSERT_EQ(cm.get_v2().version, 3);
+    ASSERT_EQ(cm.get_v2().redirect.listen_port, uint16_t{16666});
+    ASSERT_EQ(cm.get_v2().redirect.tcp_idle_timeout_seconds, 300);
+    ASSERT_EQ(cm.get_v2().redirect.udp_idle_timeout_seconds, 60);
+    ASSERT_EQ(cm.get_v2().redirect.exclude_processes.size(), size_t{2});
+
+    ASSERT_TRUE(!cm.set_raw_config(R"({"version": 4, "proxy_groups": []})").empty());
+}
+
+TEST(config_manager_rejects_bad_redirect_block) {
+    ScopedTestDirectory dir("cfgbadredir");
+    config_manager cm(dir.file("clew.json"));
+
+    ASSERT_TRUE(!cm.set_raw_config(R"({
+        "version": 3, "proxy_groups": [],
+        "redirect": {"listen_host": "0.0.0.0", "udp_idle_timeout_seconds": 0}
+    })").empty());
+    ASSERT_TRUE(!cm.set_raw_config(R"({
+        "version": 3, "proxy_groups": [],
+        "redirect": {"listen_host": "0.0.0.0", "tcp_idle_timeout_seconds": -1}
+    })").empty());
+}
+
+TEST(config_round_trip_preserves_redirect_block) {
+    // The regression this whole contract exists for: the stock ConfigV2
+    // serializer silently dropped unknown keys, so a redirect block survived a
+    // file load but vanished on the next save().
+    ScopedTestDirectory dir("cfgrt");
+    const auto path = dir.file("clew.json");
+
+    {
+        config_manager cm(path);
+        ASSERT_TRUE(cm.set_raw_config(R"({
+            "version": 3,
+            "proxy_groups": [],
+            "redirect": {
+                "listen_host": "0.0.0.0",
+                "listen_port": 16666,
+                "tcp_idle_timeout_seconds": 300,
+                "udp_idle_timeout_seconds": 60,
+                "exclude_processes": ["clew.exe", "gost.exe"]
+            }
+        })").empty());
+    }
+    {
+        config_manager cm(path);
+        ASSERT_TRUE(cm.load());
+        ASSERT_EQ(cm.get_v2().version, 3);
+        ASSERT_EQ(cm.get_v2().redirect.listen_host, std::string("0.0.0.0"));
+        ASSERT_EQ(cm.get_v2().redirect.listen_port, uint16_t{16666});
+        ASSERT_EQ(cm.get_v2().redirect.tcp_idle_timeout_seconds, 300);
+        ASSERT_EQ(cm.get_v2().redirect.udp_idle_timeout_seconds, 60);
+        ASSERT_EQ(cm.get_v2().redirect.exclude_processes.size(), size_t{2});
+
+        // And it must still be there after a save() + reload.
+        ASSERT_TRUE(cm.save());
+    }
+    {
+        config_manager cm(path);
+        ASSERT_TRUE(cm.load());
+        ASSERT_EQ(cm.get_v2().redirect.listen_port, uint16_t{16666});
+        ASSERT_EQ(cm.get_v2().redirect.exclude_processes.size(), size_t{2});
+    }
+}
+
+TEST(config_v2_without_redirect_block_loads_with_defaults) {
+    // A v0.10.0 on-disk config has no `redirect` key at all.
+    ScopedTestDirectory dir("cfgv2");
+    const auto path = dir.file("clew.json");
+    {
+        std::ofstream f(path);
+        f << R"({"version": 2, "proxy_groups": [{"id": 0, "name": "default", "host": "127.0.0.1", "port": 11080, "type": "socks5"}]})";
+    }
+    config_manager cm(path);
+    ASSERT_TRUE(cm.load());
+    ASSERT_EQ(cm.get_v2().version, 2);
+    ASSERT_EQ(cm.get_v2().redirect.listen_host, std::string("0.0.0.0"));
+    ASSERT_EQ(cm.get_v2().redirect.listen_port, uint16_t{0});
+    ASSERT_EQ(cm.get_v2().redirect.tcp_idle_timeout_seconds, 0);
+    ASSERT_EQ(cm.get_v2().redirect.udp_idle_timeout_seconds, 120);
+}
+
+TEST(port_tracker_sweep_idle_clears_only_stale_decisions) {
+    using clew::PortTracker;
+    using clew::TrackerEntry;
+    using clew::slot_state;
+
+    // The table is 65536 x 64B = 4 MiB; it must not live on the 1 MiB stack.
+    auto pt = std::make_unique<PortTracker>();
+    TrackerEntry e{};
+    e.remote_addr[0] = 0x08080808u;
+    e.remote_port = 443;
+    e.group_id = 3;
+
+    // Disabled sweep is a no-op, whatever the clock says.
+    ASSERT_EQ(pt->sweep_idle(PortTracker::now_ticks(), 0), size_t{0});
+
+    ASSERT_TRUE(pt->publish(56613, slot_state::proxied, e, 1000).outcome ==
+                clew::publish_outcome::stored);
+    ASSERT_TRUE(pt->should_reflect(56613));
+
+    // Recently used flow: spared. publish() seeds last_seen with connect_ts.
+    const int64_t idle = pt->ms_to_ticks(300'000);   // 300s
+    ASSERT_EQ(pt->sweep_idle(1000 + pt->ms_to_ticks(1'000), idle), size_t{0});
+    ASSERT_TRUE(pt->should_reflect(56613));
+
+    // Long idle: cleared. A recycled port must not inherit this decision.
+    ASSERT_EQ(pt->sweep_idle(1000 + pt->ms_to_ticks(600'000), idle), size_t{1});
+    ASSERT_FALSE(pt->should_reflect(56613));
+    ASSERT_TRUE(pt->state(56613) == slot_state::empty);
+}
+
+TEST(port_tracker_sweep_idle_spares_active_flows) {
+    using clew::PortTracker;
+    using clew::TrackerEntry;
+    using clew::slot_state;
+
+    auto pt = std::make_unique<PortTracker>();
+    TrackerEntry e{};
+    e.group_id = 1;
+
+    ASSERT_TRUE(pt->publish(40000, slot_state::proxied, e, 1000).outcome ==
+                clew::publish_outcome::stored);
+
+    // A flow that keeps carrying packets is never idle, however long it runs.
+    // This is the long-lived Roblox session case.
+    const int64_t idle = pt->ms_to_ticks(300'000);
+    int64_t now = 1000;
+    for (int i = 0; i < 100; ++i) {
+        now += pt->ms_to_ticks(60'000);       // 60s between packets
+        pt->touch(40000, now);
+        ASSERT_EQ(pt->sweep_idle(now, idle), size_t{0});
+    }
+    ASSERT_TRUE(pt->should_reflect(40000));
 }
 
 // ============================================================

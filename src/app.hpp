@@ -12,6 +12,7 @@
 #include <Windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -98,6 +99,10 @@ private:
     [[nodiscard]] std::unique_ptr<webview_app>     create_gui();
     // SOCKET-layer + SYN-parking counters for /api/stats (called off-strand).
     [[nodiscard]] nlohmann::json                   traffic_stats() const;
+    // Tracker idle sweep (redirect.tcp_idle_timeout_seconds; 0 = disabled).
+    void                                           start_idle_sweep();
+    void                                           arm_idle_sweep(int64_t idle_ticks,
+                                                                std::chrono::seconds interval);
 
     static constexpr int      API_PORT       = 18080;
     static constexpr uint16_t UDP_RELAY_PORT = 19999;
@@ -126,6 +131,8 @@ private:
     DnsManager                                        dns_mgr_;
     async_acceptor                                    acceptor_;
     uint16_t                                          redirect_port_ = 0;
+    // Null when redirect.tcp_idle_timeout_seconds == 0 (v0.10.0 behaviour).
+    std::unique_ptr<asio::steady_timer>               idle_sweep_timer_;
     std::unique_ptr<syn_parker>                       parker_;      // null when tcp_syn_parking.enabled=false
     std::unique_ptr<windivert_socket>                 wd_socket_;
     std::unique_ptr<windivert_network>                wd_network_;
