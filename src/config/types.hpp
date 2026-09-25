@@ -286,6 +286,82 @@ struct TcpSynParkingConfig {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(TcpSynParkingConfig, enabled, watchdog_ms, pool_size)
 
+// Redirect: where the reflected flows land and which processes never get
+// intercepted. Read at startup only (the acceptor bind and the sweep timers
+// are set up then); changing it requires a restart.
+//   listen_host               acceptor bind address. Default "0.0.0.0" is
+//                             REQUIRED by reflect: the address-swapped packet
+//                             is reinjected inbound as
+//                             orig_dst -> app_ip:redirect_port, so it arrives
+//                             on a real local address, not on loopback. A
+//                             socket bound to 127.0.0.1 would not accept it
+//                             and every proxied flow would stall. The value is
+//                             accepted as-is (0.0.0.0 or a local IPv4), and a
+//                             non-0.0.0.0 value only logs a warning.
+//   listen_port               acceptor bind port. 0 = ephemeral (v0.10.0
+//                             behaviour); pin it to make firewall rules and
+//                             diagnostics refer to a stable port.
+//   tcp_idle_timeout_seconds  0 = no sweep (v0.10.0 behaviour). Otherwise a
+//                             tracker slot whose flow has been idle this long
+//                             is cleared, so a port recycled by a new
+//                             connection cannot inherit a stale decision
+//                             ("replies to the wrong instance").
+//   udp_idle_timeout_seconds  idle timeout for the UDP session table
+//                             (DNS/53 is fixed at 10s). Must be > 0.
+//   exclude_processes         process file names (e.g. "gost.exe") that are
+//                             NEVER proxied, whatever the rules say. Same
+//                             purpose as the self-PID guard: keeps our own
+//                             upstream sockets out of the acceptor so a broad
+//                             rule cannot produce clew -> gost -> clew.
+struct RedirectConfig {
+    std::string listen_host = "0.0.0.0";
+    uint16_t    listen_port = 0;
+    int         tcp_idle_timeout_seconds = 0;
+    int         udp_idle_timeout_seconds = 120;
+    std::vector<std::string> exclude_processes;
+};
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(RedirectConfig, listen_host, listen_port, tcp_idle_timeout_seconds, udp_idle_timeout_seconds, exclude_processes)
+
+// Structural validation for the redirect block. Returns an empty string on
+// success, otherwise a human-readable error. Called from set_raw_config so a
+// bad value never reaches the acceptor / sweep timers.
+inline std::string validate_redirect(const RedirectConfig& r) {
+    if (r.listen_host.empty()) return "redirect.listen_host must not be empty";
+    if (r.listen_host != "0.0.0.0") {
+        // Accept a dotted-quad local address; anything else cannot be bound.
+        int octets = 0;
+        size_t i = 0;
+        bool bad = false;
+        while (i <= r.listen_host.size()) {
+            int val = 0;
+            int digits = 0;
+            while (i < r.listen_host.size() && r.listen_host[i] >= '0' && r.listen_host[i] <= '9') {
+                val = val * 10 + (r.listen_host[i] - '0');
+                ++digits;
+                ++i;
+                if (digits > 3 || val > 255) { bad = true; break; }
+            }
+            if (bad || digits == 0) return "redirect.listen_host must be '0.0.0.0' or an IPv4 address";
+            ++octets;
+            if (i == r.listen_host.size()) break;
+            if (r.listen_host[i] != '.') return "redirect.listen_host must be '0.0.0.0' or an IPv4 address";
+            ++i;
+        }
+        if (bad || octets != 4) return "redirect.listen_host must be '0.0.0.0' or an IPv4 address";
+    }
+    if (r.tcp_idle_timeout_seconds < 0)
+        return "redirect.tcp_idle_timeout_seconds must be >= 0 (0 disables the sweep)";
+    if (r.udp_idle_timeout_seconds <= 0)
+        return "redirect.udp_idle_timeout_seconds must be > 0";
+    for (const auto& name : r.exclude_processes) {
+        if (name.empty()) return "redirect.exclude_processes must not contain empty names";
+        if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos)
+            return "redirect.exclude_processes entries must be file names, not paths: " + name;
+    }
+    return {};
+}
+
 struct ConfigV2 {
     int version = 2;
     ProxyTarget default_proxy;
@@ -304,8 +380,9 @@ struct ConfigV2 {
     std::string log_level = "info";             // Runtime log level: debug/info/warning/error
     DnsConfig dns;                              // NEW: DNS proxy configuration
     TcpSynParkingConfig tcp_syn_parking;        // SYN parking switch + tuning (startup only)
+    RedirectConfig redirect;                    // Redirect target + exclusions (startup only)
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ConfigV2, version, default_proxy, proxy_groups, next_group_id, default_exclude_cidrs, auto_rules, ui, io_threads, log_level, dns, tcp_syn_parking)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ConfigV2, version, default_proxy, proxy_groups, next_group_id, default_exclude_cidrs, auto_rules, ui, io_threads, log_level, dns, tcp_syn_parking, redirect)
 
 } // namespace clew

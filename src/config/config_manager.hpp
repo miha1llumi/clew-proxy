@@ -48,6 +48,15 @@ public:
             v2_config_ = j.get<ConfigV2>();
             has_v2_ = true;
 
+            // The file path is deliberately tolerant (it does not check
+            // `version` either), but a malformed redirect block must not reach
+            // the acceptor or the sweep timers: fall back to the defaults that
+            // reproduce v0.10.0 behaviour and say so loudly.
+            if (auto err = validate_redirect(v2_config_.redirect); !err.empty()) {
+                PC_LOG_ERROR("Invalid redirect config: {} -- using defaults", err);
+                v2_config_.redirect = RedirectConfig{};
+            }
+
             ensure_proxy_groups();
 
             PC_LOG_INFO("Config loaded from {}", config_path_.string());
@@ -114,12 +123,28 @@ public:
             nlohmann::json j = nlohmann::json::parse(json_string);
 
             ConfigV2 test = j.get<ConfigV2>();
-            if (test.version != 2) {
-                return "Invalid version: expected 2";
+            if (test.version != 2 && test.version != 3) {
+                return "Invalid version: expected 2 or 3";
             }
+            if (auto err = validate_redirect(test.redirect); !err.empty()) {
+                return err;
+            }
+
+            const bool redirect_changed =
+                nlohmann::json(v2_config_.redirect) != nlohmann::json(test.redirect);
 
             v2_config_ = std::move(test);
             save();
+
+            // The redirect layer (acceptor bind, idle sweeps, process excludes) is
+            // wired once at startup from the config, so a live API edit is persisted
+            // but has no effect until the next launch. Do not accept it silently.
+            if (redirect_changed) {
+                PC_LOG_WARN(
+                    "redirect config changed via API: it is applied only at startup, "
+                    "restart clew for listen_host/listen_port/timeouts/exclude_processes "
+                    "to take effect");
+            }
             return "";
         } catch (const nlohmann::json::parse_error& e) {
             return std::string("JSON parse error: ") + e.what();
